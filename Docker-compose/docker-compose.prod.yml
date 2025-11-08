@@ -1,0 +1,23 @@
+version: '3.9'
+
+services:
+  backend:
+    build: ./backend
+    container_name: tag-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ENV=production
+    restart: always
+
+  frontend:
+    build: ./frontend
+    container_name: tag-frontend
+    ports:
+      - "80:80"  # האתר יהיה נגיש על פורט 80
+    depends_on:
+      - backend
+    environment:
+      - ENV=production
+    command: ["npx", "serve", "-s", "dist", "-l", "80"]
+    restart: always
