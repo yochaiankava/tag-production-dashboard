@@ -29,7 +29,8 @@ function App() {
     const formData = new FormData();
     formData.append("file", dbFile);
     try {
-      const res = await axios.post("http://localhost:8000/upload-db", formData);
+      //const res = await axios.post("http://localhost:8000/upload-db", formData);
+	  const res = await axios.post("https://tag-backend-row3.onrender.com", formData);
       setMessage(res.data.message);
     } catch (err) {
       console.error(err);
