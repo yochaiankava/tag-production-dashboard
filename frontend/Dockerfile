@@ -1,21 +1,23 @@
-# Dockerfile ל-frontend
-FROM node:20-bullseye
+# Dockerfile זה ישמש לפריסה ב-Render בלבד (Production)
 
-# תיקיית עבודה בתוך הקונטיינר
+# שלב 1: Build - יצירת קבצים סטטיים
+FROM node:20-alpine AS build
 WORKDIR /app
-
-# העתקת הקבצים של ניהול חבילות תחילה (לcache של Docker)
 COPY package*.json ./
-
-# התקנת תלותים בצורה נקייה
-# אם package-lock.json לא תואם ל-package.json, הוא יעודכן אוטומטית
 RUN npm install
-
-# עכשיו מעתיקים את כל הקוד
 COPY . .
+RUN npm run build # יצירת קבצי Production סטטיים בתיקיית dist
 
-# חשיפת הפורט שהיישום משתמש בו
-EXPOSE 4173
+# שלב 2: Serve - הגשת הקבצים הסטטיים
+FROM node:20-alpine
+# התקנת serve ככלי להגשת הקבצים
+RUN npm install -g serve
+WORKDIR /usr/share/nginx/html
+# העתקת התוצאה משלב ה-Build
+COPY --from=build /app/dist . 
 
-# פקודה להפעלת ה-dev server עם hot reload וכניסה מכל host
-CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "4173"]
+# חשיפת הפורט
+EXPOSE 8080 
+
+# פקודת ההפעלה (Render יריץ את זה)
+CMD ["serve", "-s", ".", "-l", "8080"]
