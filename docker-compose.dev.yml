@@ -1,0 +1,28 @@
+version: '3.9'
+
+services:
+  backend:
+    build: ./backend
+    container_name: tag-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app  # live reload של הקוד
+    environment:
+      - ENV=development
+    restart: always
+
+  frontend:
+    build: ./frontend
+    container_name: tag-frontend
+    ports:
+      - "4173:4173"
+    volumes:
+      - ./frontend:/app           # live reload של הקוד
+      - /app/node_modules         # מונע שה-volume ימחק את node_modules
+    environment:
+      - ENV=development
+    depends_on:
+      - backend
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "4173"]
+    restart: always
