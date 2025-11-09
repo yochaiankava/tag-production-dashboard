@@ -29,8 +29,7 @@ function App() {
     const formData = new FormData();
     formData.append("file", dbFile);
     try {
-      //const res = await axios.post("http://localhost:8000/upload-db", formData);
-	  const res = await axios.post("https://tag-backend-row3.onrender.com/upload-db", formData);
+      const res = await axios.post("http://localhost:8000/upload-db", formData);	  
       setMessage(res.data.message);
     } catch (err) {
       console.error(err);
@@ -44,7 +43,7 @@ function App() {
     const formData = new FormData();
     formData.append("file", tagsFile);
     try {
-      const res = await axios.post("https://tag-backend-row3.onrender.com/check-tags", formData);
+      const res = await axios.post("http://localhost:8000/check-tags", formData);
       setMessage(`Checked ${res.data.tags_count} tags`);
 
       let tags = res.data.tags.map(tag => ({
