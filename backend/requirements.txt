@@ -6,6 +6,4 @@ sqlalchemy
 python-multipart
 xlrd
 chardet
-
-
-
+psycopg2-binary

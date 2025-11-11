@@ -8,6 +8,10 @@ import numpy as np
 from pathlib import Path
 import os
 import shutil
+# --- ייבוא חדש ל-PostgreSQL ---
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
+# ------------------------------
 
 app = FastAPI()
 
@@ -23,30 +27,48 @@ app.add_middleware(
 
 # --- Path Configuration ---
 # הנתיב היחסי לתיקיית 'data' בתוך הקונטיינר (שם ה-Dockerfile מעתיק את tags.db)
-DB_DIR = Path("data") 
-DB_PATH = DB_DIR / "tags.db"
+DB_DIR = Path("data")  
+DB_PATH = DB_DIR / "tags.db" # נשמר כגיבוי ל-SQLite אם אין משתנה סביבה
 
 # EXPORT_DIR משמש לכתיבת קבצים זמניים (יאבדו ב-Restart)
 EXPORT_DIR = Path("exports")
-EXPORT_DIR.mkdir(exist_ok=True) 
+EXPORT_DIR.mkdir(exist_ok=True)  
 
-# --- Database Initialization ---
+# --- Database Engine Configuration (חדש) ---
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+def get_db_engine():
+    """יוצר מנוע DB: PostgreSQL (אם קיים URL) או SQLite (כברירת מחדל)"""
+    if DATABASE_URL:
+        # מתחבר ל-PostgreSQL חיצוני
+        print("Using PostgreSQL Engine.")
+        return create_engine(DATABASE_URL)
+    else:
+        # גיבוי ל-SQLite מקומי (לא נשמר ב-Render)
+        print("Using SQLite Engine (Local/Fallback).")
+        # ההגדרה f"sqlite:///{DB_PATH}" עדיפה ל-SQLAlchemy
+        return create_engine(f"sqlite:///{DB_PATH}")
+
+DB_ENGINE = get_db_engine()
+
+# --- Database Initialization (מותאם ל-SQLAlchemy) ---
 def init_db():
     # ודא שיש תיקייה 'data' בנתיב /app (נחוץ אם ה-DB לא הועתק מ-Git)
-    DB_DIR.mkdir(exist_ok=True) 
+    DB_DIR.mkdir(exist_ok=True)  
     
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            # יוצר טבלת תגים אם לא קיימת
-            conn.execute("""
+        # שימוש ב-DB_ENGINE במקום sqlite3.connect
+        with DB_ENGINE.connect() as conn:
+            # יוצר טבלת תגים אם לא קיימת (TEXT עובד טוב עבור כל DB)
+            conn.execute(text("""
             CREATE TABLE IF NOT EXISTS tags (
                 series TEXT,
                 device_id TEXT PRIMARY KEY,
                 production_date TEXT
             )
-            """)
+            """))
             # יוצר טבלת סטטיסטיקות אם לא קיימת
-            conn.execute("""
+            conn.execute(text("""
             CREATE TABLE IF NOT EXISTS series_stats (
                 series TEXT PRIMARY KEY,
                 count INTEGER,
@@ -54,9 +76,9 @@ def init_db():
                 max_date TEXT,
                 expected_date TEXT
             )
-            """)
+            """))
             conn.commit()
-    except Exception as e:
+    except SQLAlchemyError as e:
         # הדפסה ללוגים של Render אם יש בעיית DB
         print(f"Error during DB initialization: {e}")
 
@@ -74,35 +96,36 @@ def extract_series(device_id: str) -> str:
 def update_series_stats():
     """מעדכן את טבלת הסטטיסטיקות לאחר שינוי בטבלת tags"""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            df = pd.read_sql_query("SELECT * FROM tags", conn)
+        # שימוש ב-DB_ENGINE לקריאה
+        df = pd.read_sql_query("SELECT * FROM tags", DB_ENGINE) 
             
-            if df.empty:
-                conn.execute("DELETE FROM series_stats") 
+        if df.empty:
+            with DB_ENGINE.connect() as conn:
+                conn.execute(text("DELETE FROM series_stats"))  # שימוש ב-text עבור פקודות SQL
                 conn.commit()
                 return
                 
-            df['production_date'] = pd.to_datetime(df['production_date'], errors='coerce')
-            stats = df.groupby('series')['production_date'].agg(['count', 'min', 'max']).reset_index()
+        df['production_date'] = pd.to_datetime(df['production_date'], errors='coerce')
+        stats = df.groupby('series')['production_date'].agg(['count', 'min', 'max']).reset_index()
             
-            def compute_expected(dates):
-                dates = dates.dropna().sort_values()
-                if len(dates) == 0:
-                    return None
-                # חישוב חציון (Median) גמיש (לאחר הורדת 10% משני הקצוות)
-                lower = int(len(dates)*0.1)
-                upper = int(len(dates)*0.9)
-                trimmed = dates.iloc[lower:upper] if upper > lower else dates
-                return trimmed.iloc[len(trimmed)//2]
+        def compute_expected(dates):
+            dates = dates.dropna().sort_values()
+            if len(dates) == 0:
+                return None
+            # חישוב חציון (Median) גמיש (לאחר הורדת 10% משני הקצוות)
+            lower = int(len(dates)*0.1)
+            upper = int(len(dates)*0.9)
+            trimmed = dates.iloc[lower:upper] if upper > lower else dates
+            # Pandas 2.0 יכול להחזיר None או Timestamps
+            return trimmed.iloc[len(trimmed)//2] if not trimmed.empty else None
                 
-            stats['expected_date'] = df.groupby('series')['production_date'].apply(compute_expected).values
-            stats.rename(columns={'min': 'min_date', 'max': 'max_date'}, inplace=True)
-            stats = stats.replace({np.nan: None, np.inf: None, -np.inf: None})
+        stats['expected_date'] = df.groupby('series')['production_date'].apply(compute_expected).values
+        stats.rename(columns={'min': 'min_date', 'max': 'max_date'}, inplace=True)
+        stats = stats.replace({np.nan: None, np.inf: None, -np.inf: None})
             
-            # כתיבת הסטטיסטיקות לטבלת series_stats
-            stats.to_sql('series_stats', conn, if_exists='replace', index=False)
-            conn.commit()
-
+        # כתיבת הסטטיסטיקות לטבלת series_stats באמצעות המנוע
+        stats.to_sql('series_stats', DB_ENGINE, if_exists='replace', index=False)
+        # אין צורך ב-commit כי to_sql עושה זאת בעצמו מול המנוע
     except Exception as e:
         print(f"Error updating series stats: {e}")
 
@@ -142,23 +165,22 @@ async def upload_db(file: UploadFile = File(...)):
     df = df.dropna(subset=["production_date"])
     df["series"] = df["device_id"].astype(str).apply(extract_series)
 
-    with sqlite3.connect(DB_PATH) as conn:
-        existing_ids = pd.read_sql_query("SELECT device_id FROM tags", conn)
-        existing_ids_set = set(existing_ids["device_id"].astype(str).tolist())
-        before_count = len(df)
+    # שינוי: שימוש במנוע ה-DB החדש
+    existing_ids = pd.read_sql_query("SELECT device_id FROM tags", DB_ENGINE) 
+    existing_ids_set = set(existing_ids["device_id"].astype(str).tolist())
+    before_count = len(df)
         
-        # סינון תגים שכבר קיימים במסד הנתונים
-        df = df[~df["device_id"].astype(str).isin(existing_ids_set)]
-        new_count = len(df)
-        skipped = before_count - new_count
+    # סינון תגים שכבר קיימים במסד הנתונים
+    df = df[~df["device_id"].astype(str).isin(existing_ids_set)]
+    new_count = len(df)
+    skipped = before_count - new_count
         
-        if new_count == 0:
-            return {"message": f"No new tags added. {skipped} duplicate tags skipped."}
+    if new_count == 0:
+        return {"message": f"No new tags added. {skipped} duplicate tags skipped."}
 
-        # הוספת השורות החדשות לטבלת tags
-        df.to_sql("tags", conn, if_exists="append", index=False)
-        conn.commit()
-
+    # הוספת השורות החדשות לטבלת tags באמצעות המנוע
+    df.to_sql("tags", DB_ENGINE, if_exists="append", index=False)
+    
     update_series_stats()
     return {"message": f"Database updated with {new_count} new rows. {skipped} duplicates skipped."}
 
@@ -176,8 +198,8 @@ async def check_tags(file: UploadFile = File(...)):
     df_tags = df_tags.iloc[:, [2]].dropna()
     df_tags.columns = ["device_id"]
 
-    with sqlite3.connect(DB_PATH) as conn:
-        df_stats = pd.read_sql_query("SELECT series, expected_date FROM series_stats", conn)
+    # שינוי: שימוש במנוע ה-DB החדש
+    df_stats = pd.read_sql_query("SELECT series, expected_date FROM series_stats", DB_ENGINE)
     
     df_tags["series"] = df_tags["device_id"].astype(str).apply(extract_series)
     df_result = df_tags.merge(df_stats, on="series", how="left")
@@ -213,20 +235,20 @@ async def check_tags(file: UploadFile = File(...)):
 @app.get("/clean-duplicates")
 def clean_duplicates():
     """מנקה כפילויות של device_id מטבלת tags"""
-    with sqlite3.connect(DB_PATH) as conn:
-        df = pd.read_sql_query("SELECT * FROM tags", conn)
+    # שינוי: שימוש במנוע ה-DB החדש
+    df = pd.read_sql_query("SELECT * FROM tags", DB_ENGINE)
         
-        if df.empty:
-            return {"message": "Database is empty, nothing to clean."}
+    if df.empty:
+        return {"message": "Database is empty, nothing to clean."}
         
-        before = len(df)
-        df = df.drop_duplicates(subset=["device_id"], keep="first")
-        after = len(df)
-        removed = before - after
+    before = len(df)
+    df = df.drop_duplicates(subset=["device_id"], keep="first")
+    after = len(df)
+    removed = before - after
         
-        df.to_sql("tags", conn, if_exists="replace", index=False)
-        conn.commit()
-    
+    # כתיבה חזרה באמצעות המנוע
+    df.to_sql("tags", DB_ENGINE, if_exists="replace", index=False)
+        
     update_series_stats()
     return {"duplicates_removed": removed, "remaining_tags": after}
 
@@ -246,18 +268,18 @@ async def update_series(file: UploadFile = File(...)):
     df_new = df_new.dropna(subset=["production_date"])
     df_new["series"] = df_new["device_id"].astype(str).apply(extract_series)
 
-    with sqlite3.connect(DB_PATH) as conn:
-        df_existing = pd.read_sql_query("SELECT * FROM tags", conn)
+    # שינוי: שימוש במנוע ה-DB החדש
+    df_existing = pd.read_sql_query("SELECT * FROM tags", DB_ENGINE)
         
-        # מיזוג: השתמש בסדרה החדשה (series_y) אם קיימת, אחרת השתמש בישנה (series_x)
-        merged = df_existing.drop(columns=["series"]).merge(
-            df_new[["device_id", "series"]], on="device_id", how="left", suffixes=('_x', '_y')
-        )
-        merged["series"] = merged["series_y"].combine_first(merged["series_x"])
-        merged = merged[["device_id", "production_date", "series"]]
+    # מיזוג: השתמש בסדרה החדשה (series_y) אם קיימת, אחרת השתמש בישנה (series_x)
+    merged = df_existing.drop(columns=["series"]).merge(
+        df_new[["device_id", "series"]], on="device_id", how="left", suffixes=('_x', '_y')
+    )
+    merged["series"] = merged["series_y"].combine_first(merged["series_x"])
+    merged = merged[["device_id", "production_date", "series"]]
         
-        merged.to_sql("tags", conn, if_exists="replace", index=False)
-        conn.commit()
+    # כתיבה חזרה באמצעות המנוע
+    merged.to_sql("tags", DB_ENGINE, if_exists="replace", index=False)
 
     update_series_stats()
     return {"message": "Series updated successfully according to new file."}
@@ -266,15 +288,15 @@ async def update_series(file: UploadFile = File(...)):
 def tags_export():
     """ייצוא כל נתוני התגים לקובץ Excel"""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            df_tags = pd.read_sql_query("SELECT * FROM tags", conn)
+        # שינוי: שימוש במנוע ה-DB החדש
+        df_tags = pd.read_sql_query("SELECT * FROM tags", DB_ENGINE)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"DB read error: {e}"})
-    
+        
     if df_tags.empty:
         return JSONResponse(status_code=404, content={"error": "No tags to export."})
         
-    export_file = EXPORT_DIR / "tags_export.xlsx" 
+    export_file = EXPORT_DIR / "tags_export.xlsx"  
     df_tags.to_excel(export_file, index=False)
     
     return FileResponse(export_file, filename="tags_export.xlsx", media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -282,8 +304,8 @@ def tags_export():
 @app.get("/all-tags")
 def get_all_tags():
     """שולף את כל התגים במסד הנתונים"""
-    with sqlite3.connect(DB_PATH) as conn:
-        df_tags = pd.read_sql_query("SELECT * FROM tags", conn)
+    # שינוי: שימוש במנוע ה-DB החדש
+    df_tags = pd.read_sql_query("SELECT * FROM tags", DB_ENGINE)
         
     if df_tags.empty:
         return {"message": "Database is empty."}
@@ -294,8 +316,8 @@ def get_all_tags():
 @app.get("/series-stats")
 def get_series_stats():
     """שולף את סטטיסטיקות הסדרות (Series)"""
-    with sqlite3.connect(DB_PATH) as conn:
-        df_stats = pd.read_sql_query("SELECT * FROM series_stats", conn)
+    # שינוי: שימוש במנוע ה-DB החדש
+    df_stats = pd.read_sql_query("SELECT * FROM series_stats", DB_ENGINE)
         
     if df_stats.empty:
         return {"message": "No series statistics available."}
@@ -306,8 +328,8 @@ def get_series_stats():
 @app.get("/yearly-distribution")
 def yearly_distribution():
     """חישוב חלוקת התגים לפי שנה"""
-    with sqlite3.connect(DB_PATH) as conn:
-        df_tags = pd.read_sql_query("SELECT production_date FROM tags", conn)
+    # שינוי: שימוש במנוע ה-DB החדש
+    df_tags = pd.read_sql_query("SELECT production_date FROM tags", DB_ENGINE)
         
     if df_tags.empty:
         return {"error": "No tags in database."}
